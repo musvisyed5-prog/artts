@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from decouple import config
 from django.utils.translation import gettext_lazy
@@ -7,21 +8,34 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config('SECRET_KEY')
+# Demo fallback so the prototype boots without a real secret configured.
+SECRET_KEY = config('SECRET_KEY', default='django-insecure-demo-key-not-for-real-production')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=False, cast=bool)
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS').split()
-CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS').split()
+# Vercel automatically sets VERCEL_URL to the deployment's own domain.
+VERCEL_URL = os.environ.get('VERCEL_URL', '')
+
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost 127.0.0.1 .vercel.app').split()
+if VERCEL_URL and VERCEL_URL not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(VERCEL_URL)
+
+CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS', default='https://*.vercel.app').split()
+if VERCEL_URL and f'https://{VERCEL_URL}' not in CSRF_TRUSTED_ORIGINS:
+    CSRF_TRUSTED_ORIGINS.append(f'https://{VERCEL_URL}')
 
 # Custom user model
 AUTH_USER_MODEL = 'core.User'
 
 # Groq ai
-GROQ_API_KEY = config('GROQ_API_KEY')
+GROQ_API_KEY = config('GROQ_API_KEY', default='')
 GROQ_REWRITE_LIMIT = 4
 GROQ_CACHE_TIMEOUT = 86400
+
+# Demo mode: without a real email provider configured, don't force email
+# verification on signup since verification emails would go nowhere visible.
+BREVO_API_KEY = config('BREVO_API_KEY', default='')
 
 # Allauth
 
@@ -34,7 +48,7 @@ ACCOUNT_FORMS = {
     'signup': 'core.forms.SignupForm',
 }
 ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
-ACCOUNT_EMAIL_VERIFICATION = 'mandatory'
+ACCOUNT_EMAIL_VERIFICATION = 'mandatory' if BREVO_API_KEY else 'optional'
 ACCOUNT_LOGIN_METHODS = {'email'}
 SOCIALACCOUNT_LOGIN_ON_GET = True
 ACCOUNT_SESSION_REMEMBER = True
@@ -171,16 +185,27 @@ WSGI_APPLICATION = 'src.wsgi.application'
 
 # Database
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('DB_NAME'),
-        'USER': config('DB_USER'),
-        'PASSWORD': config('DB_PASSWORD'),
-        'HOST': config('DB_HOST'),
-        'PORT': config('DB_PORT'),
+# Demo fallback: use SQLite in /tmp (the only writable path on Vercel's
+# serverless filesystem) when no real Postgres credentials are configured.
+DB_HOST = config('DB_HOST', default='')
+if DB_HOST:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': config('DB_NAME', default=''),
+            'USER': config('DB_USER', default=''),
+            'PASSWORD': config('DB_PASSWORD', default=''),
+            'HOST': DB_HOST,
+            'PORT': config('DB_PORT', default='5432'),
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': '/tmp/db.sqlite3',
+        }
+    }
 
 # Background task
 TASKS = {
@@ -310,35 +335,61 @@ if DEBUG:
         }
     }
 else:
-    # Static and media files
-    STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
-    CLOUDINARY_STORAGE = {
-        'CLOUD_NAME': config('CLOUD_NAME'),
-        'API_KEY': config('CLOUDINARY_API_KEY'),
-        'API_SECRET': config('CLOUDINARY_API_SECRET'),
-    }
+    # Serverless filesystem is read-only except /tmp, and collectstatic
+    # hasn't run at build time, so use the no-manifest whitenoise storage
+    # (it doesn't require a pre-built manifest to resolve {% static %} URLs).
+    STATIC_ROOT = Path('/tmp/staticfiles')
+    STATICFILES_STORAGE = "whitenoise.storage.CompressedStaticFilesStorage"
+
+    CLOUD_NAME = config('CLOUD_NAME', default='')
+    if CLOUD_NAME:
+        CLOUDINARY_STORAGE = {
+            'CLOUD_NAME': CLOUD_NAME,
+            'API_KEY': config('CLOUDINARY_API_KEY', default=''),
+            'API_SECRET': config('CLOUDINARY_API_SECRET', default=''),
+        }
+        default_storage_backend = "cloudinary_storage.storage.MediaCloudinaryStorage"
+    else:
+        # Demo fallback: no Cloudinary account configured, store media in /tmp.
+        # Uploaded files won't persist across cold starts or be publicly served.
+        default_storage_backend = "django.core.files.storage.FileSystemStorage"
+        MEDIA_ROOT = Path('/tmp/media')
 
     STORAGES = {
         "default": {
-            "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
+            "BACKEND": default_storage_backend,
         },
         "staticfiles": {
-            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+            "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
         },
     }
     # Cache
 
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-            'LOCATION': config('REDIS_CACHE_URL'),
+    REDIS_CACHE_URL = config('REDIS_CACHE_URL', default='')
+    if REDIS_CACHE_URL:
+        CACHES = {
+            'default': {
+                'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                'LOCATION': REDIS_CACHE_URL,
+            }
         }
-    }
-    EMAIL_BACKEND = "anymail.backends.brevo.EmailBackend"
-    ANYMAIL = {
-        "BREVO_API_KEY": config('BREVO_API_KEY'),
-    }
-    DEFAULT_FROM_EMAIL = config('EMAIL_HOST_USER')
+    else:
+        # Demo fallback: no Redis configured, use local in-process cache.
+        CACHES = {
+            'default': {
+                'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            }
+        }
+
+    if BREVO_API_KEY:
+        EMAIL_BACKEND = "anymail.backends.brevo.EmailBackend"
+        ANYMAIL = {
+            "BREVO_API_KEY": BREVO_API_KEY,
+        }
+    else:
+        # Demo fallback: no email provider configured, just log emails.
+        EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+    DEFAULT_FROM_EMAIL = config('EMAIL_HOST_USER', default='demo@example.com')
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     ACCOUNT_DEFAULT_HTTP_PROTOCOL = 'https'
     SECURE_SSL_REDIRECT = True
